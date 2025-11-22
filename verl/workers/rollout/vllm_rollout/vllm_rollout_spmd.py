@@ -48,6 +48,8 @@ from verl.utils.debug import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
 
+import os
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -291,12 +293,37 @@ class vLLMRollout(BaseRollout):
                 for k, v in first.items():
                     print(f"  - {k}: {type(v)} len={len(v) if hasattr(v, '__len__') else v}")
             
-            outputs = self.inference_engine.generate(
-                prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                lora_request=lora_requests,
-                use_tqdm=False,
-            )
+            stream_rollout_and_train = int(os.environ.get("stream_rollout_and_train", "0"))
+            
+            if stream_rollout_and_train==0:
+                outputs = self.inference_engine.generate(
+                    prompts=vllm_inputs,  # because we have already convert it to prompt token id
+                    sampling_params=self.sampling_params,
+                    lora_request=lora_requests,
+                    use_tqdm=False,
+                )
+            else:
+                pop_outputs = int(os.environ.get("pop_outputs_config", "4"))
+
+                all_outputs = []
+                # 调用新的 stream_generate，每次返回 <= pop_outputs 个 RequestOutput
+                for chunk in self.inference_engine.stream_generate(
+                    prompts=vllm_inputs,  # 已经是 prompt_token_ids 形式
+                    sampling_params=self.sampling_params,
+                    lora_request=lora_requests,
+                    use_tqdm=False,
+                    pop_outputs=pop_outputs,
+                ):
+                    # 这里 chunk: List[RequestOutput]
+                    print(
+                        f"[verl] got {len(chunk)} finished outputs: "
+                        f"{[o.request_id for o in chunk]}"
+                    )
+                    all_outputs.extend(chunk)
+
+                # 和原来的 _run_engine 一样，按 request_id 排序一下，保证顺序
+                outputs = sorted(all_outputs, key=lambda x: int(x.request_id))
+            
             
             # 调试：打印输出列表长度和第一个 RequestOutput 的关键信息
             print(f"[vllm_rollout] outputs len={len(outputs)}")
